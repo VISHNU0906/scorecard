@@ -111,6 +111,8 @@ func (handler *commitsHandler) zip(commitsRaw []*gitlab.Commit, data graphqlData
 		}
 		commitToMRIID[mr.MergeCommitSHA] = mr.IID
 	}
+	// Squash commits are absent from commits.nodes and mergeCommitSha.
+	linkSquashCommits(commitToMRIID, commitsRaw, data.Project.MergeRequests.Nodes)
 
 	iidToMr := make(map[string]clients.PullRequest)
 	for i := range data.Project.MergeRequests.Nodes {
@@ -188,6 +190,45 @@ func (handler *commitsHandler) zip(commitsRaw []*gitlab.Commit, data graphqlData
 	}
 
 	return commits
+}
+
+// linkSquashCommits maps a squash commit to the merge request that created it.
+//
+// GitLab's GraphQL MergeRequest exposes mergeCommitSha and the pre-squash
+// commits.nodes SHAs, but not the squash SHA (REST squash_commit_sha).
+// On a squash merge that also creates a merge commit, those pre-squash SHAs
+// are often not on the target branch, so the squash commit stays unlinked
+// and Code-Review counts it as its own unreviewed changeset.
+// The merge commit's second parent is that squash commit. For an ordinary
+// merge the second parent is the merge request head, which is already linked.
+func linkSquashCommits(commitToMRIID map[string]string, commitsRaw []*gitlab.Commit, mrs []graphqlMergeRequestNode) {
+	rawBySHA := make(map[string]*gitlab.Commit, len(commitsRaw))
+	for _, c := range commitsRaw {
+		if c == nil || c.ID == "" {
+			continue
+		}
+		rawBySHA[c.ID] = c
+	}
+
+	for i := range mrs {
+		mr := mrs[i]
+		if mr.MergeCommitSHA == "" {
+			continue
+		}
+		mergeCommit := rawBySHA[mr.MergeCommitSHA]
+		if mergeCommit == nil || len(mergeCommit.ParentIDs) < 2 {
+			continue
+		}
+		squashSHA := mergeCommit.ParentIDs[1]
+		if squashSHA == "" {
+			continue
+		}
+		// Keep a SHA that commits.nodes already tied to a different merge request.
+		if existing, ok := commitToMRIID[squashSHA]; ok && existing != mr.IID {
+			continue
+		}
+		commitToMRIID[squashSHA] = mr.IID
+	}
 }
 
 // Expected email form: <firstname>.<lastname>@<namespace>.com.
